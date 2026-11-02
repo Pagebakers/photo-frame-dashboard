@@ -111,48 +111,9 @@ Android's own menus get smaller too. The setting survives a reboot.
 
 ## Screen brightness from Home Assistant (MQTT)
 
-Home HQ can hand the screen to Home Assistant over MQTT: brightness, off, and wake on touch. It
-does nothing until a broker is saved. Step-by-step setup with Home Assistant's Mosquitto add-on:
-[kiosk-screen-mqtt.md](../../docs/kiosk-screen-mqtt.md). In short:
-
-```sh
-adb shell appops set com.wesbos.homehq WRITE_SETTINGS allow
-adb shell am start -n com.wesbos.homehq/.MainActivity --es mqtt_host <broker-ip> --es mqtt_user <user> --es mqtt_password <password>
-```
-
-Values pass through the frame's shell a second time, so wrap one with spaces or shell characters
-in both kinds of quotes, as in `--es mqtt_name "'Van frame'"`; with single quotes alone only the
-first word is saved. Optional extras: `--es mqtt_port 1883` (the default) and `--es mqtt_name`, the
-device's name in Home Assistant (default `Home HQ`). The first line lets Home HQ change Android's
-brightness setting, so it also holds while another app is in front; without it, only the kiosk's
-own window changes.
-
-Home Assistant then finds the device, with:
-
-- **Screen**, a light: on at a brightness of 1 to 255, or off. Off is a black cover over the
-  dashboard at the lowest backlight, not Android sleep: some frames drop Wi-Fi while the screen
-  sleeps ([akimart-zn-dp1002.md](../../docs/akimart-zn-dp1002.md)).
-- **Wake brightness** (1 to 255, default 180) and **Wake timeout** (seconds, default 60): a touch
-  raises a dimmer or off screen to Wake brightness until Wake timeout after the last touch. On an
-  off screen, the first touch only wakes it and doesn't reach the dashboard.
-- **Touched**, a binary sensor: on from a touch until the wake timeout ends.
-
-The light reports what the screen shows: during a touch wake it reads on at Wake brightness, and
-it returns to the level Home Assistant set when the wake ends. A command from Home Assistant ends a
-touch wake at once. Home HQ saves the last state, so after a reboot the screen comes back as Home
-Assistant left it, before the broker answers. While Home HQ is offline, Home Assistant shows the
-device as unavailable. Android may not go below its own minimum brightness; off is dark anyway
-because of the cover.
-
-The password is kept in the app's private storage, which anyone with ADB on a rooted frame can
-read, so give the frame its own user. To turn screen control off:
-
-```sh
-adb shell am start -n com.wesbos.homehq/.MainActivity --es mqtt_host "''"
-adb shell appops set com.wesbos.homehq WRITE_SETTINGS default
-```
-
-The entities stay in Home Assistant until you delete the device in the MQTT integration.
+Home HQ can hand the screen to Home Assistant over MQTT: a brightness light, off, and wake on
+touch. It does nothing until a broker is saved. Setup and details are in
+[kiosk-screen-mqtt.md](../../docs/kiosk-screen-mqtt.md).
 
 ## Frames without Home or Back buttons
 

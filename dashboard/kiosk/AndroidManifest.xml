@@ -6,6 +6,8 @@
   <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
   <!-- Optional; only used if granted with adb (see kiosk README). -->
   <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+  <!-- Optional; lets screen control from Home Assistant change Android's brightness setting. -->
+  <uses-permission android:name="android.permission.WRITE_SETTINGS" />
 
   <application
       android:label="Home HQ"

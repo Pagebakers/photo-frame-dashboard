@@ -7,6 +7,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
@@ -16,6 +17,7 @@ import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.net.Uri;
 import android.net.http.SslError;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -65,6 +67,9 @@ import java.util.Map;
  *     adb shell cmd package set-home-activity com.wesbos.homehq/.Home
  * - Wi-Fi with a sign-in page (captive portal): when the dashboard can't load on Wi-Fi, the kiosk
  *   checks for one and shows it, so the terms can be accepted; then it returns to the dashboard.
+ * - Screen brightness from Home Assistant over MQTT, with wake on touch (see Screen). Off until a
+ *   broker is saved; --es mqtt_host "''" turns it off again:
+ *     adb shell am start -n com.wesbos.homehq/.MainActivity --es mqtt_host <ip> --es mqtt_user <user> --es mqtt_password <password>
  */
 public class MainActivity extends Activity {
   static final String TAG = "HomeHQ";
@@ -89,6 +94,18 @@ public class MainActivity extends Activity {
   static final long PORTAL_CHECK_MS = 5000;
   static final long PORTAL_GIVE_UP_MS = 10 * 60 * 1000;
   static final int PROBE_ONLINE = 0, PROBE_PORTAL = 1, PROBE_FAILED = 2;
+  // Saved from launch extras of the same names (strings; --es mqtt_port 1883).
+  static final String PREF_MQTT_HOST = "mqtt_host";
+  static final String PREF_MQTT_PORT = "mqtt_port";
+  static final String PREF_MQTT_USER = "mqtt_user";
+  static final String PREF_MQTT_PASSWORD = "mqtt_password";
+  static final String PREF_MQTT_NAME = "mqtt_name";
+  static final String[] MQTT_PREFS = {PREF_MQTT_HOST, PREF_MQTT_PORT, PREF_MQTT_USER, PREF_MQTT_PASSWORD, PREF_MQTT_NAME};
+  // The screen's state from Home Assistant, so it survives a restart without the broker.
+  static final String PREF_SCREEN_ON = "screen_on";
+  static final String PREF_SCREEN_BRIGHTNESS = "screen_brightness";
+  static final String PREF_WAKE_BRIGHTNESS = "wake_brightness";
+  static final String PREF_WAKE_SECONDS = "wake_seconds";
 
   private WebView web;
   private Button menuButton;
@@ -112,6 +129,14 @@ public class MainActivity extends Activity {
   private long portalSince;
   private LinearLayout portalBar;
   private TextView portalText;
+  // Screen control; null while no broker is saved.
+  private Screen screen;
+  private Mqtt mqtt;
+  private int mqttGeneration; // callbacks from a replaced client are ignored
+  private View cover;
+  private int shownBrightness = -1;
+  private boolean shownTouched, swallowTouch, warnedBrightness;
+  private final Runnable screenTick = this::showScreen;
 
   private final Runnable retry = new Runnable() {
     @Override
@@ -178,6 +203,7 @@ public class MainActivity extends Activity {
     super.onCreate(state);
     applyDebugFlag(getIntent());
     applyHomeFlag(getIntent());
+    applyMqttFlags(getIntent());
     keepNavigationEnabled();
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
         | WindowManager.LayoutParams.FLAG_FULLSCREEN);
@@ -294,6 +320,12 @@ public class MainActivity extends Activity {
     menuPosition.setMargins(dp(12), dp(12), dp(12), dp(12));
     root.addView(menuButton, menuPosition);
     applyMenuButtonFlag(getIntent());
+    // Covers everything while Home Assistant has the screen off; the first touch only wakes it.
+    cover = new View(this);
+    cover.setBackgroundColor(Color.BLACK);
+    cover.setClickable(true);
+    cover.setVisibility(View.GONE);
+    root.addView(cover);
     setContentView(root);
 
     String url = urlFrom(getIntent());
@@ -302,6 +334,7 @@ public class MainActivity extends Activity {
     IntentFilter connectivity = new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION);
     connectivity.addAction(Intent.ACTION_TIME_CHANGED); // network time arrived after a power cut
     registerReceiver(networkChange, connectivity);
+    startScreenControl();
   }
 
   @Override
@@ -324,6 +357,7 @@ public class MainActivity extends Activity {
     applyDebugFlag(intent);
     applyHomeFlag(intent);
     applyMenuButtonFlag(intent);
+    if (applyMqttFlags(intent)) startScreenControl();
     String url = urlFrom(intent);
     if (url != null) {
       closePortal();
@@ -722,6 +756,7 @@ public class MainActivity extends Activity {
 
   @Override
   protected void onDestroy() {
+    stopScreenControl();
     unregisterReceiver(networkChange);
     handler.removeCallbacksAndMessages(null);
     if (web != null) web.destroy();
@@ -755,9 +790,189 @@ public class MainActivity extends Activity {
     Log.i(TAG, "Home alias " + (home ? "on" : "off"));
   }
 
+  /** Saves broker settings given as mqtt_* extras; returns whether there were any. */
+  private boolean applyMqttFlags(Intent intent) {
+    Bundle extras = intent == null ? null : intent.getExtras();
+    if (extras == null) return false;
+    SharedPreferences.Editor edit = getSharedPreferences(PREFS, MODE_PRIVATE).edit();
+    boolean any = false;
+    for (String key : MQTT_PREFS) {
+      if (!extras.containsKey(key)) continue;
+      Object value = extras.get(key);
+      edit.putString(key, value == null ? "" : value.toString().trim());
+      any = true;
+    }
+    if (any) {
+      edit.apply();
+      Log.i(TAG, "Saved MQTT settings");
+    }
+    return any;
+  }
+
+  /** Connects to the saved broker, replacing any earlier connection. Without a broker it does nothing. */
+  private void startScreenControl() {
+    stopScreenControl();
+    SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
+    String host = p.getString(PREF_MQTT_HOST, "");
+    if (host.isEmpty()) {
+      screen = null;
+      cover.setVisibility(View.GONE);
+      WindowManager.LayoutParams lp = getWindow().getAttributes();
+      lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
+      getWindow().setAttributes(lp);
+      shownBrightness = -1;
+      return;
+    }
+    String id = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+    if (id == null || id.isEmpty()) id = "frame";
+    screen = new Screen(id, p.getString(PREF_MQTT_NAME, "Home HQ"), Build.MODEL, versionName());
+    int current = Settings.System.getInt(getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, 180);
+    screen.on = p.getBoolean(PREF_SCREEN_ON, true);
+    screen.brightness = p.getInt(PREF_SCREEN_BRIGHTNESS, Math.max(1, current));
+    screen.wakeBrightness = p.getInt(PREF_WAKE_BRIGHTNESS, 180);
+    screen.wakeSeconds = p.getInt(PREF_WAKE_SECONDS, 60);
+    int port;
+    try {
+      port = Integer.parseInt(p.getString(PREF_MQTT_PORT, "1883"));
+    } catch (NumberFormatException e) {
+      port = 1883;
+    }
+    final int gen = mqttGeneration;
+    mqtt = new Mqtt(host, port, "homehq-" + id, p.getString(PREF_MQTT_USER, ""),
+        p.getString(PREF_MQTT_PASSWORD, ""), screen.topic("status"), "offline", screen.subscriptions(),
+        new Mqtt.Listener() {
+          @Override
+          public void onConnected() {
+            Log.i(TAG, "MQTT connected to " + host);
+            handler.post(() -> {
+              if (gen == mqttGeneration) publishScreen(true);
+            });
+          }
+
+          @Override
+          public void onMessage(String topic, String payload) {
+            handler.post(() -> {
+              if (gen == mqttGeneration) onScreenMessage(topic, payload);
+            });
+          }
+
+          @Override
+          public void onDisconnected(String reason) {
+            Log.w(TAG, "MQTT " + host + ": " + reason + ", retrying");
+          }
+        });
+    mqtt.start();
+    showScreen();
+  }
+
+  private void stopScreenControl() {
+    mqttGeneration++;
+    if (mqtt != null) mqtt.stop();
+    mqtt = null;
+    handler.removeCallbacks(screenTick);
+  }
+
+  private void onScreenMessage(String topic, String payload) {
+    if (Screen.BIRTH_TOPIC.equals(topic)) {
+      if ("online".equals(payload)) publishScreen(true); // Home Assistant restarted
+      return;
+    }
+    if (!screen.command(topic, payload)) {
+      Log.w(TAG, "Ignoring MQTT message on " + topic);
+      return;
+    }
+    getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+        .putBoolean(PREF_SCREEN_ON, screen.on)
+        .putInt(PREF_SCREEN_BRIGHTNESS, screen.brightness)
+        .putInt(PREF_WAKE_BRIGHTNESS, screen.wakeBrightness)
+        .putInt(PREF_WAKE_SECONDS, screen.wakeSeconds)
+        .apply();
+    showScreen();
+    publishScreen(false);
+  }
+
+  /** Publishes the screen's states, with discovery first if asked. Everything is retained. */
+  private void publishScreen(boolean discovery) {
+    if (mqtt == null || screen == null) return;
+    if (discovery) {
+      for (String[] m : screen.discovery()) mqtt.publish(m[0], m[1], true);
+      mqtt.publish(screen.topic("status"), "online", true);
+    }
+    for (String[] m : screen.states(SystemClock.uptimeMillis())) mqtt.publish(m[0], m[1], true);
+  }
+
+  /** Shows the level Home Assistant and touches ask for: the black cover when dark, else the backlight. */
+  private void showScreen() {
+    handler.removeCallbacks(screenTick);
+    if (screen == null) return;
+    long now = SystemClock.uptimeMillis();
+    int level = screen.level(now);
+    cover.setVisibility(level == 0 ? View.VISIBLE : View.GONE);
+    setBrightness(Math.max(level, 1)); // Android's lowest; the cover does the rest
+    boolean touched = screen.touched(now);
+    if (touched != shownTouched) {
+      shownTouched = touched;
+      publishScreen(false); // the Touched sensor
+    }
+    if (touched) handler.postDelayed(screenTick, screen.wakeUntil - now);
+  }
+
+  /**
+   * Sets Android's brightness setting if WRITE_SETTINGS was granted, so it holds in every app:
+   *   adb shell appops set com.wesbos.homehq WRITE_SETTINGS allow
+   * Without it, only this window's brightness changes, while the kiosk is in front.
+   */
+  private void setBrightness(int value) {
+    if (value == shownBrightness) return;
+    shownBrightness = value;
+    WindowManager.LayoutParams lp = getWindow().getAttributes();
+    if (Settings.System.canWrite(this)) {
+      try {
+        Settings.System.putInt(getContentResolver(), Settings.System.SCREEN_BRIGHTNESS_MODE,
+            Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL);
+        Settings.System.putInt(getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, value);
+        if (lp.screenBrightness != WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE) {
+          lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
+          getWindow().setAttributes(lp);
+        }
+        return;
+      } catch (SecurityException e) {
+        Log.w(TAG, "Could not change the brightness setting", e);
+      }
+    }
+    if (!warnedBrightness) {
+      warnedBrightness = true;
+      Log.w(TAG, "WRITE_SETTINGS not granted: brightness only applies while the kiosk is in front");
+    }
+    lp.screenBrightness = value / 255f;
+    getWindow().setAttributes(lp);
+  }
+
+  private String versionName() {
+    try {
+      return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+    } catch (PackageManager.NameNotFoundException e) {
+      return "";
+    }
+  }
+
   /** Watches for the two-finger exit hold; all touches still go to the page (after a stale-touch reset). */
   @Override
   public boolean dispatchTouchEvent(MotionEvent e) {
+    // A touch on a dark screen only wakes it: no part of that gesture reaches the page.
+    if (swallowTouch) {
+      int action = e.getActionMasked();
+      if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) swallowTouch = false;
+      return true;
+    }
+    if (screen != null && e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+      boolean wasDark = screen.touch(SystemClock.uptimeMillis());
+      showScreen();
+      if (wasDark) {
+        swallowTouch = true;
+        return true;
+      }
+    }
     switch (e.getActionMasked()) {
       case MotionEvent.ACTION_DOWN:
         // Android sends DOWN only when every earlier finger has lifted. If the page still holds a
